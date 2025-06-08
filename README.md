@@ -2,7 +2,7 @@
 
 A fast, efficient CLI tool that imports photos and videos directly from your iPhone to your computer via USB. Preserves original timestamps, skips duplicates, and works without iCloud or iTunes sync.
 
-## 🚀 Quick Start
+## Quick Start
 
 1. Connect your iPhone via USB
    - (If on **Windows**: Make sure [iTunes/Apple Devices app](https://support.apple.com/en-us/HT210384) is installed and running.)
@@ -18,6 +18,7 @@ import-iphone-media ~/Pictures/iPhone
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [Features](#features)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -27,10 +28,10 @@ import-iphone-media ~/Pictures/iPhone
 
 ## Features
 
-- 📱 Connects to your iPhone via USB (no iCloud required)
-- 🏷️ Preserves original modification and creation times (file timestamps are synced to match your iPhone)
-- 📂 Imports only new media (photos, videos) to a local directory and keeps a database of imported files
-- 🖥️ Cross-platform (Windows, macOS, Linux)
+- Connects to your iPhone via USB (no iCloud required)
+- Preserves original modification and creation times (file timestamps are synced to match your iPhone)
+- Imports only new media (photos, videos) to a local directory and keeps a database of imported files
+- Cross-platform (Windows, macOS, Linux)
 
 ## Installation
 
