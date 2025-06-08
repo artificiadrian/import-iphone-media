@@ -1,0 +1,17 @@
+[project]
+name = "import-iphone-media"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pymobiledevice3==4.21.1",
+    "rich==14.0.0",
+]
+
+[project.scripts]
+"import-iphone-media" = "import_iphone_media.main:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
