@@ -2,6 +2,8 @@
 
 A fast, efficient CLI tool that imports photos and videos directly from your iPhone to your computer via USB. Preserves original timestamps, skips duplicates, and works without iCloud or iTunes sync.
 
+_This project is not affiliated with or endorsed by Apple Inc. ‘iPhone’ is a trademark of Apple Inc._
+
 ## Quick Start
 
 1. Connect your iPhone via USB
