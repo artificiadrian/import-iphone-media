@@ -70,17 +70,18 @@ def main(
     from rich.console import Console
 
     console = Console()
-    console.print(
-        f"Importing media files from [blue]'{dcim_path}'[/blue] on your iPhone to [blue]'{output_path.absolute()}'[/blue]"
-    )
     n_new, n_existing = 0, 0
 
-    def _summarize_to_str():
+    def _fancy_stats():
         return f"Imported [bold][green]{n_new}[/bold] new[/green] and skipped [bold][yellow]{n_existing}[/bold] existing[/yellow] files"
 
     if not output_path.exists():
         console.print(f"[red]Output path '{output_path}' does not exist.[/red]")
         return
+
+    console.print(
+        f"Importing media files from [blue]'{dcim_path}'[/blue] on your iPhone to [blue]'{output_path.absolute()}'[/blue]"
+    )
 
     try:
         with console.status("Connecting to iPhone...") as status:
@@ -102,9 +103,9 @@ def main(
 
                 color = "green" if isinstance(file, NewFile) else "yellow"
 
-                status.update(f"{_summarize_to_str()}. ([{color}]'{file.afc_path}'[/{color}])")
+                status.update(f"{_fancy_stats()}. ([{color}]'{file.afc_path}'[/{color}])")
 
-        console.print(f"[bold green]Import completed![/] {_summarize_to_str()}")
+        console.print(f"[bold green]Import completed![/] {_fancy_stats()}")
 
     except ConnectionError:
         if verbose:
@@ -113,7 +114,7 @@ def main(
         console.print(
             "\n[red]An error occurred while connecting to your iPhone.[/red]\n - If you are using Windows, please ensure that the iTunes/Apple Devices app is installed and running.\n - Check the USB connection to your iPhone.\n - Ensure your iPhone is unlocked and trusted.\n"
         )
-        console.print(f"[bold red]Import failed![/] {_summarize_to_str()}")
+        console.print(f"[bold red]Import failed![/] {_fancy_stats()}")
 
     except Exception as e:
         if verbose:
@@ -122,7 +123,7 @@ def main(
         hint = "Check the error message above for more details." if verbose else f"{e}"
 
         console.print(f"\n[red]An unexpected error occurred while importing media files. {hint}[/red]\n")
-        console.print(f"[bold red]Import failed![/] {_summarize_to_str()}")
+        console.print(f"[bold red]Import failed![/] {_fancy_stats()}")
 
     except KeyboardInterrupt:
-        console.print(f"[bold red]Import cancelled by user![/] {_summarize_to_str()}")
+        console.print(f"[bold red]Import cancelled by user![/] {_fancy_stats()}")
