@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Optional, cast
 
 from pydantic import BaseModel
 
@@ -37,7 +37,7 @@ class IgnoredFile(BaseModel):
 def import_media_files(
     output_path: Path,
     dcim_path: str = DCIM_PATH,
-    db_path: Path | None = None,
+    db_path: Optional[Path] = None,
     include_extensions: list[str] = INCLUDE_EXTENSIONS,
     connection_retries: int = 3,
 ):
@@ -46,7 +46,7 @@ def import_media_files(
     Args:
         output_path (Path): Directory where media files should be downloaded to.
         dcim_path (str): Directory on iPhone to scan for media files.
-        db_path (Path | None): Path to the database file where information on imported media will be stored.
+        db_path (Optional[Path]): Path to the database file where information on imported media will be stored.
         include_extensions (list[str]): List of file extensions to include in the import.
         connection_retries (int): Number of retries to connect to the iPhone.
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 
 from import_iphone_media.importer import (
     DCIM_PATH,
@@ -63,7 +64,7 @@ def cli():
 def main(
     output_path: Path,
     dcim_path: str = DCIM_PATH,
-    db_path: Path | None = None,
+    db_path: Optional[Path] = None,
     include_extensions: list[str] = INCLUDE_EXTENSIONS,
     verbose: bool = False,
 ):
