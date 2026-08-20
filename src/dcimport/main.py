@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import math
 import sys
 from collections.abc import Sequence
@@ -44,6 +45,20 @@ from dcimport.importer import (
     resolve_layout,
 )
 from dcimport.layout import InvalidLayoutError, Layout, parse_layout
+
+
+class _RecoveredAfcWarningFilter(logging.Filter):
+    def __init__(self, *, show_recovered: bool):
+        super().__init__()
+        self._show_recovered = show_recovered
+
+    def filter(  # pyright: ignore[reportImplicitOverride]
+        self, record: logging.LogRecord
+    ) -> bool:
+        return self._show_recovered or not (
+            record.levelno == logging.WARNING
+            and record.msg == "AFC: no waiter for packet_num=%d"
+        )
 
 
 def _parse_date(value: str):
@@ -118,11 +133,14 @@ def _parse_positive_int(value: str) -> int:
     return parsed
 
 
-def _parse_args():
+def _create_parser():
     parser = argparse.ArgumentParser(
         description="Import media files from iPhone",
         add_help=False,
     )
+    # Python 3.14 enables argparse colors by default. Keep help output neutral and
+    # consistent with supported older Python versions.
+    parser.color = False  # pyright: ignore[reportAttributeAccessIssue]
     device_options = parser.add_argument_group("device options")
     selection_options = parser.add_argument_group("file selection")
     output_options = parser.add_argument_group("output options")
@@ -272,6 +290,12 @@ def _parse_args():
         action="version",
         version=version("dcimport"),
     )
+
+    return parser
+
+
+def _parse_args():
+    parser = _create_parser()
 
     args = parser.parse_args()
 
@@ -655,6 +679,9 @@ def main(
     )
 
     console = Console()
+    afc_logger = logging.getLogger("pymobiledevice3.services.afc")
+    warning_filter = _RecoveredAfcWarningFilter(show_recovered=verbose)
+    afc_logger.addFilter(warning_filter)
 
     try:
         exit_code = asyncio.run(_run_import(console, config))
@@ -727,3 +754,5 @@ def main(
 
     else:
         return exit_code
+    finally:
+        afc_logger.removeFilter(warning_filter)

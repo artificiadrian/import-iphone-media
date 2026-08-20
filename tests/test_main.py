@@ -1,4 +1,5 @@
 import json
+import logging
 import sqlite3
 import sys
 from datetime import datetime
@@ -269,6 +270,7 @@ def test_cli_rejects_invalid_execution_limits(
 
 
 def test_cli_help_uses_named_groups(monkeypatch, capsys):
+    parser = main_module._create_parser()
     monkeypatch.setattr(sys, "argv", ["dcimport", "--help"])
 
     with pytest.raises(SystemExit) as exited:
@@ -280,3 +282,26 @@ def test_cli_help_uses_named_groups(monkeypatch, capsys):
     assert "file selection:" in output
     assert "diagnostics:" in output
     assert "\noptions:\n" not in output
+    assert vars(parser)["color"] is False
+
+
+@pytest.mark.parametrize(("verbose", "visible"), [(False, False), (True, True)])
+def test_recovered_afc_warning_is_only_logged_when_verbose(
+    monkeypatch, tmp_path, caplog, verbose, visible
+):
+    fake = FakeSource()
+    fake.add("/DCIM/100APPLE/IMG_0001.JPG", data=b"jpegdata", mtime=MTIME)
+    logger = logging.getLogger("pymobiledevice3.services.afc")
+
+    async def connect(*args, **kwargs):
+        logger.warning("AFC: no waiter for packet_num=%d", 17369)
+        return fake
+
+    monkeypatch.setattr(main_module, "afc_connect", connect)
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        exit_code = main(tmp_path / "photos", verbose=verbose)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert exit_code == 0
+    assert ("AFC: no waiter for packet_num=17369" in messages) is visible
