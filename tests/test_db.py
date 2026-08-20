@@ -1,7 +1,9 @@
 import sqlite3
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import cast
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -10,6 +12,7 @@ from dcimport.db import MediaDatabase
 
 PATH = PurePosixPath("/DCIM/100APPLE/IMG_0001.JPG")
 MTIME = datetime(2024, 1, 2, 3, 4, 5)
+_TZSET = cast("Callable[[], None] | None", vars(time).get("tzset"))
 
 
 def _complete_import(db: MediaDatabase, target: Path, size: int, mtime: datetime):
@@ -176,15 +179,17 @@ def test_legacy_database_migration_rejects_nonexistent_local_time(tmp_path):
         MediaDatabase(db_path, legacy_timezone=ZoneInfo("Europe/Berlin"))
 
 
-@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset is POSIX-only")
+@pytest.mark.skipif(_TZSET is None, reason="time.tzset is POSIX-only")
 def test_dedup_survives_host_timezone_change(tmp_path, open_db, monkeypatch):
+    assert _TZSET is not None
+
     # pymobiledevice3 derives st_mtime via datetime.fromtimestamp (naive local time),
     # so the same device file yields a different wall-clock in a different timezone.
     # Dedup must key on the underlying instant, not the local rendering.
     epoch = 1_700_000_000
 
     monkeypatch.setenv("TZ", "Europe/Berlin")
-    time.tzset()
+    _TZSET()
     try:
         db = open_db(tmp_path / "media.db")
         _complete_import(
@@ -192,12 +197,12 @@ def test_dedup_survives_host_timezone_change(tmp_path, open_db, monkeypatch):
         )
 
         monkeypatch.setenv("TZ", "America/New_York")
-        time.tzset()
+        _TZSET()
 
         assert db.contains(PATH, 100, datetime.fromtimestamp(epoch))
     finally:
         monkeypatch.undo()
-        time.tzset()
+        _TZSET()
 
 
 def test_completed_imports_persist_across_reopen(tmp_path, open_db):
