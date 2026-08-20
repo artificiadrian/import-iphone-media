@@ -12,3 +12,6 @@ wheels/
 # Tooling caches
 .pytest_cache/
 .ruff_cache/
+
+# macOS metadata
+.DS_Store

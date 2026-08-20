@@ -1,21 +1,24 @@
-# Regenerates the README demo (WebP).  Run:  vhs demo.tape
+# Regenerates the README demo. Run:
+#   vhs demo.tape
+#   gif2webp -mixed -q 90 -m 6 -mt /tmp/dcimport-demo.gif -o .assets/demo.webp
 #
 # Requires:
-#   - vhs installed (https://github.com/charmbracelet/vhs)
+#   - vhs and gif2webp installed
 #   - an iPhone connected over USB, unlocked, and trusted
 #   - `dcimport` on PATH (e.g. `uv tool install .` from this repo)
 #
-# Tune Sleep to roughly your transfer time, and Height to just fit the output
-# (crop empty space). Resolution is deliberately high: a big FontSize + Width
-# render sharp text that GitHub downscales — a small canvas comes out blurry.
+# The README displays this 1800 px recording at exactly 900 CSS pixels. The 2:1
+# ratio keeps terminal text sharp on Retina displays and avoids fractional scaling.
 
-Output .assets/demo.webp
+Output "/tmp/dcimport-demo.gif"
 
 Set Shell "bash"
-Set FontSize 22
-Set Width 1200
-Set Height 240
-Set Padding 20
+Set FontSize 34
+Set Width 1800
+Set Height 360
+Set Padding 32
+Set Framerate 20
+Set CursorBlink false
 Set TypingSpeed 50ms
 Set Theme "Catppuccin Mocha"
 
@@ -32,9 +35,7 @@ Show
 Type "dcimport /tmp/dcimport-demo"
 Sleep 200ms
 Enter
-Sleep 12s      # <- adjust to your import duration
-
-Sleep 2500ms
+Sleep 30s
 
 # --- optional extra beats: uncomment to also show a custom layout ---
 # Type "dcimport /tmp/dcimport-demo-by-date --layout '{mtime:%Y}/{mtime:%m}/{name}'"

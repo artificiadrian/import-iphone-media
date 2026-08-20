@@ -1,9 +1,15 @@
 import asyncio
 import sqlite3
-from pathlib import PurePosixPath
+import subprocess
+import sys
+import textwrap
+from datetime import datetime
+from pathlib import Path, PurePosixPath
 
 import pytest
+from typing_extensions import override
 
+from dcimport.db import MediaDatabase
 from dcimport.importer import (
     FailedFile,
     LayoutConflictError,
@@ -94,17 +100,6 @@ def test_interrupted_download_leaves_no_trace(source, tmp_path):
     assert leftovers == []
 
 
-def test_interrupted_download_is_retried_on_next_run(source, tmp_path):
-    source.add("/DCIM/100APPLE/IMG_0001.JPG", data=b"jpegdata", mtime=MTIME)
-    persistently_fail(source, "/DCIM/100APPLE/IMG_0001.JPG")
-
-    run_import(source, tmp_path)
-    results = run_import(source, tmp_path)
-
-    assert any(isinstance(r, NewFile) for r in results)
-    assert (tmp_path / "2024-01-02_03-04-05_IMG_0001.JPG").read_bytes() == b"jpegdata"
-
-
 def test_persistent_failure_yields_failed_file_and_continues(source, tmp_path):
     source.add("/DCIM/100APPLE/IMG_0001.JPG")
     source.add("/DCIM/100APPLE/IMG_0002.JPG", data=b"second")
@@ -129,6 +124,7 @@ def test_failed_file_is_reattempted_on_next_run(source, tmp_path):
 
     assert any(isinstance(r, FailedFile) for r in first)
     assert any(isinstance(r, NewFile) for r in second)
+    assert (tmp_path / "2024-01-02_03-04-05_IMG_0001.JPG").read_bytes() == b"jpegdata"
 
 
 def test_transient_download_failure_is_retried(source, tmp_path):
@@ -149,6 +145,50 @@ def test_keyboard_interrupt_is_not_retried(source, tmp_path):
         run_import(source, tmp_path)
 
     assert source.download_calls["/DCIM/100APPLE/IMG_0001.JPG"] == 1
+
+
+def test_keyboard_interrupt_does_not_log_unretrieved_task():
+    script = textwrap.dedent(
+        """
+        import asyncio
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from dcimport.importer import execute_import, plan_import, resolve_layout
+        from tests.fake_source import FakeSource, InMemoryDb
+
+        async def run():
+            source = FakeSource()
+            source.add("/DCIM/100APPLE/IMG_0001.JPG")
+            source.fail_next_download("/DCIM/100APPLE/IMG_0001.JPG", KeyboardInterrupt())
+            db = InMemoryDb()
+            plan = await plan_import(source, db)
+            with TemporaryDirectory() as directory:
+                async for _ in execute_import(
+                    source,
+                    db,
+                    plan,
+                    Path(directory),
+                    resolve_layout(db, None, False),
+                ):
+                    pass
+
+        try:
+            asyncio.run(run())
+        except KeyboardInterrupt:
+            pass
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "Task exception was never retrieved" not in result.stderr
 
 
 def test_name_collisions_get_numeric_suffix(source, tmp_path):
@@ -174,6 +214,17 @@ def test_existing_local_file_is_not_overwritten(source, tmp_path):
     assert (tmp_path / "2024-01-02_03-04-05_IMG_0001_1.JPG").read_bytes() == b"new"
 
 
+def test_dangling_target_symlink_gets_numeric_suffix(source, tmp_path):
+    target = tmp_path / "2024-01-02_03-04-05_IMG_0001.JPG"
+    target.symlink_to(tmp_path / "missing.JPG")
+    source.add("/DCIM/100APPLE/IMG_0001.JPG", data=b"new", mtime=MTIME)
+
+    run_import(source, tmp_path)
+
+    assert target.is_symlink()
+    assert (tmp_path / "2024-01-02_03-04-05_IMG_0001_1.JPG").read_bytes() == b"new"
+
+
 def test_missing_output_directory_is_created(source, tmp_path):
     source.add("/DCIM/100APPLE/IMG_0001.JPG", data=b"x", mtime=MTIME)
 
@@ -183,6 +234,185 @@ def test_missing_output_directory_is_created(source, tmp_path):
     assert (
         tmp_path / "photos" / "iphone" / "2024-01-02_03-04-05_IMG_0001.JPG"
     ).read_bytes() == b"x"
+
+
+def test_layout_can_follow_user_created_directory_symlink(source, tmp_path):
+    source.add("/DCIM/100APPLE/IMG_0001.JPG", data=b"jpegdata", mtime=MTIME)
+    output_path = tmp_path / "photos"
+    outside_path = tmp_path / "outside"
+    output_path.mkdir()
+    outside_path.mkdir()
+    (output_path / "album").symlink_to(outside_path, target_is_directory=True)
+
+    results = run_import(source, output_path, layout="album/{name}")
+
+    assert isinstance(results[0], NewFile)
+    assert (outside_path / "IMG_0001.JPG").read_bytes() == b"jpegdata"
+
+
+def test_download_does_not_follow_temporary_symlink(source, tmp_path):
+    source.add("/DCIM/100APPLE/IMG_0001.JPG", data=b"jpegdata", mtime=MTIME)
+    outside = tmp_path / "outside.JPG"
+    outside.write_bytes(b"precious")
+    temporary = tmp_path / "2024-01-02_03-04-05_IMG_0001.JPG.part"
+    temporary.symlink_to(outside)
+
+    results = run_import(source, tmp_path)
+
+    assert any(isinstance(result, NewFile) for result in results)
+    assert outside.read_bytes() == b"precious"
+    assert temporary.is_symlink()
+    assert not (tmp_path / "2024-01-02_03-04-05_IMG_0001.JPG").is_symlink()
+
+
+def test_target_created_during_download_is_not_overwritten(source, tmp_path):
+    source.add("/DCIM/100APPLE/IMG_0001.JPG", data=b"jpegdata", mtime=MTIME)
+    target = tmp_path / "2024-01-02_03-04-05_IMG_0001.JPG"
+    original_download = source.download
+
+    async def download(path, output):
+        await original_download(path, output)
+        target.write_bytes(b"precious")
+
+    source.download = download
+
+    results = run_import(source, tmp_path)
+
+    assert isinstance(results[0], FailedFile)
+    assert target.read_bytes() == b"precious"
+    assert scan(source, tmp_path).to_download
+
+
+def test_execute_import_rejects_nonpositive_concurrency(source, tmp_path):
+    source.add("/DCIM/100APPLE/IMG_0001.JPG")
+
+    async def download():
+        db = InMemoryDb()
+        plan = await plan_import(source, db)
+        layout = resolve_layout(db, None, False)
+        return [
+            result
+            async for result in execute_import(
+                source, db, plan, tmp_path, layout, concurrency=0
+            )
+        ]
+
+    with pytest.raises(ValueError, match="concurrency"):
+        asyncio.run(asyncio.wait_for(download(), timeout=0.01))
+
+
+def test_execute_import_rejects_negative_retry_count(source, tmp_path):
+    source.add("/DCIM/100APPLE/IMG_0001.JPG")
+
+    async def download():
+        db = InMemoryDb()
+        plan = await plan_import(source, db)
+        layout = resolve_layout(db, None, False)
+        return [
+            result
+            async for result in execute_import(
+                source, db, plan, tmp_path, layout, download_retries=-1
+            )
+        ]
+
+    with pytest.raises(ValueError, match="download_retries"):
+        asyncio.run(download())
+
+
+class BlockingDownloadSource(FakeSource):
+    def __init__(self):
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.started = asyncio.Event()
+
+    @override
+    async def download(self, path, target):
+        self.download_calls[str(path)] += 1
+        self.active_downloads += 1
+        self.max_concurrent_downloads = max(
+            self.max_concurrent_downloads, self.active_downloads
+        )
+
+        if self.active_downloads == 2:
+            self.started.set()
+
+        try:
+            await self.gate.wait()
+            target.write(self.files[str(path)].data)
+        finally:
+            self.active_downloads -= 1
+
+
+class RollingDownloadSource(FakeSource):
+    def __init__(self):
+        super().__init__()
+        self.first_gate = asyncio.Event()
+        self.third_started = asyncio.Event()
+
+    @override
+    async def download(self, path, target):
+        self.download_calls[str(path)] += 1
+
+        if path.name == "IMG_0000.JPG":
+            await self.first_gate.wait()
+        elif path.name == "IMG_0002.JPG":
+            self.third_started.set()
+
+        target.write(self.files[str(path)].data)
+
+
+def test_execute_import_creates_only_one_batch_of_download_tasks(tmp_path):
+    source = BlockingDownloadSource()
+    for i in range(100):
+        source.add(f"/DCIM/100APPLE/IMG_{i:04}.JPG")
+
+    async def download():
+        db = InMemoryDb()
+        plan = await plan_import(source, db)
+        layout = resolve_layout(db, None, False)
+
+        async def collect():
+            return [
+                result
+                async for result in execute_import(
+                    source, db, plan, tmp_path, layout, concurrency=2
+                )
+            ]
+
+        task = asyncio.create_task(collect())
+        await source.started.wait()
+        pending = len(asyncio.all_tasks()) - 1
+        source.gate.set()
+        await task
+        return pending
+
+    assert asyncio.run(download()) <= 3
+
+
+def test_execute_import_reuses_available_download_slot(tmp_path):
+    source = RollingDownloadSource()
+    for i in range(3):
+        source.add(f"/DCIM/100APPLE/IMG_{i:04}.JPG")
+
+    async def download():
+        db = InMemoryDb()
+        plan = await plan_import(source, db)
+        layout = resolve_layout(db, None, False)
+
+        async def collect():
+            return [
+                result
+                async for result in execute_import(
+                    source, db, plan, tmp_path, layout, concurrency=2
+                )
+            ]
+
+        task = asyncio.create_task(collect())
+        await asyncio.wait_for(source.third_started.wait(), timeout=1)
+        source.first_gate.set()
+        await task
+
+    asyncio.run(download())
 
 
 def test_downloads_run_concurrently(source, tmp_path):
@@ -273,28 +503,54 @@ def test_transient_incomplete_download_is_retried_to_success(source, tmp_path):
     assert (tmp_path / "2024-01-02_03-04-05_IMG_0001.JPG").read_bytes() == b"jpegdata"
 
 
-class _RecordFailsFor:
-    """A Database whose record() raises for one device path, simulating a transient
-    failure in the finalize step (e.g. a momentarily locked SQLite db)."""
+def test_reconciles_file_after_complete_import_failure(tmp_path):
+    source = FakeSource()
+    source.add("/DCIM/100APPLE/IMG_0001.JPG", data=b"jpegdata", mtime=MTIME)
+    db = MediaDatabase(tmp_path / "media.db")
+    layout = resolve_layout(db, None, False)
+
+    def fail_complete_import(afc_path, st_size, st_mtime):
+        msg = "database is locked"
+        raise sqlite3.OperationalError(msg)
+
+    db.complete_import = fail_complete_import
+
+    async def _collect():
+        plan = await plan_import(source, db)
+        first = [
+            result
+            async for result in execute_import(source, db, plan, tmp_path, layout)
+        ]
+        recovered = await plan_import(source, db)
+        return first, recovered
+
+    try:
+        first, recovered = asyncio.run(_collect())
+    finally:
+        db.close()
+
+    assert isinstance(first[0], FailedFile)
+    assert not recovered.to_download
+    assert (tmp_path / "2024-01-02_03-04-05_IMG_0001.JPG").exists()
+    assert not (tmp_path / "2024-01-02_03-04-05_IMG_0001_1.JPG").exists()
+
+
+class _RecordFailsFor(InMemoryDb):
+    """An in-memory database whose finalization fails for one device path."""
 
     def __init__(self, fail_path: str):
+        super().__init__()
         self._fail_path = fail_path
-        self._inner = InMemoryDb()
 
-    def contains(self, afc_path, st_size, st_mtime):
-        return self._inner.contains(afc_path, st_size, st_mtime)
-
-    def record(self, afc_path, st_size, st_mtime):
+    @override
+    def complete_import(
+        self, afc_path: PurePosixPath, st_size: int, st_mtime: datetime
+    ):
         if str(afc_path) == self._fail_path:
             msg = "database is locked"
             raise sqlite3.OperationalError(msg)
-        self._inner.record(afc_path, st_size, st_mtime)
 
-    def get_setting(self, key):
-        return self._inner.get_setting(key)
-
-    def set_setting(self, key, value):
-        self._inner.set_setting(key, value)
+        super().complete_import(afc_path, st_size, st_mtime)
 
 
 def test_finalize_error_becomes_failed_file_and_continues(tmp_path):

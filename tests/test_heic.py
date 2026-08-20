@@ -1,11 +1,20 @@
+import asyncio
 import io
+import sqlite3
 
 import pillow_heif
 import pytest
 from PIL import Image
 
 import dcimport.heic as heic
-from dcimport.importer import NewFile
+from dcimport.db import MediaDatabase
+from dcimport.importer import (
+    FailedFile,
+    NewFile,
+    execute_import,
+    plan_import,
+    resolve_layout,
+)
 from tests.fake_source import DEFAULT_MTIME as MTIME
 from tests.fake_source import FakeSource
 from tests.helpers import run_import, scan
@@ -98,3 +107,49 @@ def test_missing_heic_support_raises(source, tmp_path, monkeypatch):
 
     with pytest.raises(heic.MissingHeicSupportError):
         run_import(source, tmp_path, convert_heic=True)
+
+
+def test_conversion_does_not_follow_temporary_symlink(source, tmp_path):
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"precious")
+    temporary = tmp_path / "2024-01-02_03-04-05_IMG_0001.jpg.converted.part"
+    temporary.symlink_to(outside)
+
+    results = run_import(source, tmp_path, convert_heic=True)
+
+    assert any(isinstance(result, NewFile) for result in results)
+    assert outside.read_bytes() == b"precious"
+    assert temporary.is_symlink()
+
+
+def test_converted_file_recovers_after_database_finalize_failure(source, tmp_path):
+    db = MediaDatabase(tmp_path / "media.db")
+    layout = resolve_layout(db, None, False)
+    complete_import = db.complete_import
+
+    def fail_complete_import(afc_path, st_size, st_mtime):
+        msg = "database is locked"
+        raise sqlite3.OperationalError(msg)
+
+    db.complete_import = fail_complete_import
+
+    async def collect():
+        plan = await plan_import(source, db)
+        first = [
+            result
+            async for result in execute_import(
+                source, db, plan, tmp_path, layout, convert_heic=True
+            )
+        ]
+        db.complete_import = complete_import
+        recovered = await plan_import(source, db)
+        return first, recovered
+
+    try:
+        first, recovered = asyncio.run(collect())
+    finally:
+        db.close()
+
+    assert isinstance(first[0], FailedFile)
+    assert not recovered.to_download
+    assert not (tmp_path / "2024-01-02_03-04-05_IMG_0001_1.jpg").exists()

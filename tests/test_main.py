@@ -1,4 +1,6 @@
 import json
+import sqlite3
+import sys
 from datetime import datetime
 
 import pytest
@@ -72,7 +74,7 @@ def test_layout_conflict_returns_one(source, tmp_path):
     assert exit_code == 1
 
 
-def test_invalid_layout_fails_before_connecting(monkeypatch, tmp_path):
+def test_invalid_layout_has_no_side_effects(monkeypatch, tmp_path):
     connected = False
 
     async def connect(*args, **kwargs):
@@ -81,24 +83,13 @@ def test_invalid_layout_fails_before_connecting(monkeypatch, tmp_path):
         return FakeSource()
 
     monkeypatch.setattr(main_module, "afc_connect", connect)
+    output_path = tmp_path / "photos"
 
-    exit_code = main(tmp_path / "photos", layout="{bogus}")
+    exit_code = main(output_path, layout="{bogus}")
 
     assert exit_code == 1
     assert not connected
-
-
-def test_invalid_layout_creates_no_output_dir(monkeypatch, tmp_path):
-    async def connect(*args, **kwargs):
-        return FakeSource()
-
-    monkeypatch.setattr(main_module, "afc_connect", connect)
-    out = tmp_path / "photos"
-
-    exit_code = main(out, layout="{bogus}")
-
-    assert exit_code == 1
-    assert not out.exists()
+    assert not output_path.exists()
 
 
 def test_already_up_to_date_returns_zero(source, tmp_path, capsys):
@@ -127,7 +118,24 @@ def test_failed_files_are_listed(source, tmp_path, capsys):
     out = capsys.readouterr().out
     assert exit_code == 1
     assert "IMG_0001.JPG" in out
-    assert "could not be downloaded" in out
+    assert "Failed files" in out
+    assert "retry failed files" in out
+
+
+def test_file_phrase_styles_the_complete_phrase():
+    phrase = main_module._file_phrase(1, "new", "bold green")
+
+    assert phrase.plain == "1 new file"
+    assert phrase.style == "bold green"
+
+
+def test_summary_uses_consistent_file_terms(source, tmp_path, capsys):
+    main(tmp_path / "photos")
+
+    output = capsys.readouterr().out
+    assert "Found 1 new file" in output
+    assert "0 existing files" in output
+    assert "Import complete. Imported 1 new file; skipped 0 existing files." in output
 
 
 def test_since_flag_skips_older_files(monkeypatch, tmp_path):
@@ -157,3 +165,118 @@ def test_manifest_records_imported_and_failed(source, tmp_path):
     data = json.loads(manifest.read_text())
     assert [r["afc_path"] for r in data["imported"]] == ["/DCIM/100APPLE/IMG_0001.JPG"]
     assert [r["afc_path"] for r in data["failed"]] == ["/DCIM/100APPLE/IMG_0002.JPG"]
+
+
+def test_cli_accepts_legacy_timezone(source, tmp_path, monkeypatch):
+    output_path = tmp_path / "photos"
+    output_path.mkdir()
+    conn = sqlite3.connect(output_path / "media.db")
+    conn.execute(
+        "CREATE TABLE media (afc_path TEXT NOT NULL, st_size INTEGER NOT NULL,"
+        " st_mtime DATETIME NOT NULL, synced_at DATETIME DEFAULT CURRENT_TIMESTAMP,"
+        " UNIQUE(afc_path, st_size, st_mtime))"
+    )
+    conn.execute(
+        "INSERT INTO media (afc_path, st_size, st_mtime) VALUES (?, ?, ?)",
+        ("/DCIM/100APPLE/OLD.JPG", 3, "2024-01-02T03:04:05"),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dcimport", "--legacy-timezone", "UTC", str(output_path)],
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        main_module.cli()
+
+    assert exited.value.code == 0
+
+
+def test_cli_rejects_legacy_fold_without_timezone(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dcimport", "--legacy-fold", "earlier", str(tmp_path / "photos")],
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        main_module.cli()
+
+    assert exited.value.code == 2
+    assert "requires --legacy-timezone" in capsys.readouterr().err
+
+
+def test_cli_forwards_device_timeouts(source, tmp_path, monkeypatch):
+    received = {}
+
+    async def connect(**kwargs):
+        received.update(kwargs)
+        return source
+
+    monkeypatch.setattr(main_module, "afc_connect", connect)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "dcimport",
+            "--operation-timeout",
+            "12.5",
+            "--pair-timeout",
+            "3",
+            str(tmp_path / "photos"),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        main_module.cli()
+
+    assert exited.value.code == 0
+    assert received == {"udid": None, "operation_timeout": 12.5, "pair_timeout": 3.0}
+
+
+@pytest.mark.parametrize("timeout", ["0", "nan", "inf"])
+def test_cli_rejects_invalid_operation_timeout(tmp_path, monkeypatch, capsys, timeout):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dcimport", "--operation-timeout", timeout, str(tmp_path / "photos")],
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        main_module.cli()
+
+    assert exited.value.code == 2
+    assert "must be greater than zero" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("option", "value"), [("--concurrency", "0"), ("--retries", "-1")]
+)
+def test_cli_rejects_invalid_execution_limits(
+    tmp_path, monkeypatch, capsys, option, value
+):
+    monkeypatch.setattr(
+        sys, "argv", ["dcimport", option, value, str(tmp_path / "photos")]
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        main_module.cli()
+
+    assert exited.value.code == 2
+    assert "must" in capsys.readouterr().err
+
+
+def test_cli_help_uses_named_groups(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["dcimport", "--help"])
+
+    with pytest.raises(SystemExit) as exited:
+        main_module.cli()
+
+    output = capsys.readouterr().out
+    assert exited.value.code == 0
+    assert "device options:" in output
+    assert "file selection:" in output
+    assert "diagnostics:" in output
+    assert "\noptions:\n" not in output

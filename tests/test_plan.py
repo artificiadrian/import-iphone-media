@@ -2,7 +2,10 @@ import asyncio
 from datetime import datetime
 from pathlib import PurePosixPath
 
-from dcimport.importer import plan_import
+import pytest
+from typing_extensions import override
+
+from dcimport.importer import FileStat, plan_import
 from tests.fake_source import DEFAULT_MTIME as MTIME
 from tests.fake_source import FakeSource, InMemoryDb
 
@@ -25,9 +28,11 @@ def test_plan_lists_new_files_with_total_bytes():
     assert plan.total_bytes == 15
 
 
-def test_plan_separates_already_imported_files():
+def test_plan_separates_already_imported_files(tmp_path):
     db = InMemoryDb()
-    db.record(PurePosixPath("/DCIM/100APPLE/IMG_0001.JPG"), 5, MTIME)
+    path = PurePosixPath("/DCIM/100APPLE/IMG_0001.JPG")
+    db.begin_import(path, 5, MTIME, tmp_path / "IMG_0001.JPG", 5)
+    db.complete_import(path, 5, MTIME)
 
     plan = asyncio.run(plan_import(make_source(), db))
 
@@ -120,3 +125,89 @@ def test_scan_reports_running_count():
 
     # one callback per stat'd candidate (the two wanted files), counting up
     assert counts == [1, 2]
+
+
+class BlockingStatSource(FakeSource):
+    def __init__(self):
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.started = asyncio.Event()
+
+    @override
+    async def stat(self, path):
+        self.stat_calls[str(path)] += 1
+        self.active_stats += 1
+        self.max_concurrent_stats = max(self.max_concurrent_stats, self.active_stats)
+
+        if self.active_stats == 2:
+            self.started.set()
+
+        try:
+            await self.gate.wait()
+            file = self.files[str(path)]
+            return FileStat(size=len(file.data), mtime=file.mtime)
+        finally:
+            self.active_stats -= 1
+
+
+class RollingStatSource(FakeSource):
+    def __init__(self):
+        super().__init__()
+        self.first_gate = asyncio.Event()
+        self.third_started = asyncio.Event()
+
+    @override
+    async def stat(self, path):
+        if path.name == "IMG_0000.JPG":
+            await self.first_gate.wait()
+        elif path.name == "IMG_0002.JPG":
+            self.third_started.set()
+
+        file = self.files[str(path)]
+        return FileStat(size=len(file.data), mtime=file.mtime)
+
+
+def test_plan_rejects_nonpositive_stat_concurrency():
+    source = make_source()
+
+    async def plan():
+        return await plan_import(source, InMemoryDb(), stat_concurrency=0)
+
+    with pytest.raises(ValueError, match="stat_concurrency"):
+        asyncio.run(asyncio.wait_for(plan(), timeout=0.01))
+
+
+def test_plan_creates_only_one_batch_of_stat_tasks():
+    source = BlockingStatSource()
+    for i in range(100):
+        source.add(f"/DCIM/100APPLE/IMG_{i:04}.JPG")
+
+    async def plan():
+        task = asyncio.create_task(
+            plan_import(source, InMemoryDb(), stat_concurrency=2)
+        )
+        await source.started.wait()
+        pending = len(asyncio.all_tasks()) - 1
+        source.gate.set()
+        await task
+        return pending
+
+    assert asyncio.run(plan()) <= 3
+
+
+def test_plan_reuses_available_stat_slot():
+    source = RollingStatSource()
+    for i in range(3):
+        source.add(f"/DCIM/100APPLE/IMG_{i:04}.JPG")
+
+    async def plan():
+        task = asyncio.create_task(
+            plan_import(source, InMemoryDb(), stat_concurrency=2)
+        )
+        await asyncio.wait_for(source.third_started.wait(), timeout=1)
+        source.first_gate.set()
+        return await task
+
+    result = asyncio.run(plan())
+
+    assert len(result.to_download) == 3

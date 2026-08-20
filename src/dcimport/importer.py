@@ -1,10 +1,11 @@
 import asyncio
 import itertools
 import os
+import tempfile
 from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from dcimport import heic
 from dcimport.immutable import immutable
@@ -18,6 +19,12 @@ LAYOUT_SETTING = "layout"
 
 LIVE_PHOTO_IMAGE_EXTENSIONS = (".heic", ".jpg", ".jpeg")
 LIVE_PHOTO_VIDEO_EXTENSION = ".mov"
+
+
+def _require_at_least(value: int, minimum: int, name: str) -> None:
+    if value < minimum:
+        msg = f"{name} must be at least {minimum}"
+        raise ValueError(msg)
 
 
 class LayoutConflictError(Exception):
@@ -55,21 +62,32 @@ class MediaSource(Protocol):
         """Return the metadata of the entry at `path`."""
         ...
 
-    async def download(self, path: PurePosixPath, target: Path) -> None:
+    async def download(self, path: PurePosixPath, target: BinaryIO) -> None:
         """Download the file at `path` to the local `target` path."""
         ...
 
 
 class Database(Protocol):
-    """The library database as the importer needs it: dedup lookup, recording, settings."""
+    """The library database used for deduplication, import recovery, and settings."""
 
     def contains(
         self, afc_path: PurePosixPath, st_size: int, st_mtime: datetime
     ) -> bool: ...
 
-    def record(
+    def begin_import(
+        self,
+        afc_path: PurePosixPath,
+        st_size: int,
+        st_mtime: datetime,
+        local_path: Path,
+        local_size: int,
+    ) -> None: ...
+
+    def complete_import(
         self, afc_path: PurePosixPath, st_size: int, st_mtime: datetime
     ) -> None: ...
+
+    def reconcile_pending_imports(self) -> None: ...
 
     def get_setting(self, key: str) -> str | None: ...
 
@@ -162,7 +180,7 @@ def _available_path(target: Path, reserved: set[Path]):
     n = 0
     candidate = target
 
-    while candidate.exists() or candidate in reserved:
+    while os.path.lexists(candidate) or candidate in reserved:
         n += 1
         candidate = target.with_name(f"{target.stem}_{n}{target.suffix}")
 
@@ -180,10 +198,14 @@ async def plan_import(
     on_scan_progress: Callable[[int], None] | None = None,
     stat_concurrency: int = 16,
 ):
-    """Scan `source` and classify every entry. Read-only: downloads and writes nothing.
+    """Reconcile completed pending imports, then scan and classify every device entry.
     With `skip_live_videos`, the video halves of Live Photos are ignored. `since`/`until`
     bound the files to import by modification time (inclusive). `on_scan_progress` is
     called with the running count of files stat'ed, for live feedback during the scan."""
+
+    _require_at_least(stat_concurrency, 1, "stat_concurrency")
+
+    db.reconcile_pending_imports()
 
     wanted_extensions = {
         normalized
@@ -251,23 +273,43 @@ async def _stat_all(
     """Stat every path concurrently (one USB round-trip each), preserving input order.
     Reports a running count to `on_progress` as each stat completes."""
 
-    semaphore = asyncio.Semaphore(concurrency)
     completed = itertools.count(1)
+    stats: list[FileStat | DirEntry | None] = [None] * len(paths)
 
-    async def stat_one(path: PurePosixPath):
-        async with semaphore:
-            stat = await source.stat(path)
+    async def stat_one(index: int, path: PurePosixPath):
+        stat = await source.stat(path)
         if on_progress is not None:
             on_progress(next(completed))
-        return stat
+        return index, stat
 
-    return await asyncio.gather(*(stat_one(path) for path in paths))
+    indexed_paths = iter(enumerate(paths))
+
+    async with asyncio.TaskGroup() as task_group:
+        pending = {
+            task_group.create_task(stat_one(index, path))
+            for index, path in itertools.islice(indexed_paths, concurrency)
+        }
+
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for task in done:
+                index, result = task.result()
+                stats[index] = result
+
+                if next_item := next(indexed_paths, None):
+                    next_index, next_path = next_item
+                    pending.add(task_group.create_task(stat_one(next_index, next_path)))
+
+    return [stat for stat in stats if stat is not None]
 
 
 async def _download_to_temp(
     source: MediaSource,
     path: PurePosixPath,
-    temp_path: Path,
+    target_path: Path,
     expected_size: int,
     retries: int,
 ):
@@ -278,8 +320,18 @@ async def _download_to_temp(
     download_error = None
 
     for _attempt in range(retries + 1):
+        descriptor, raw_temp_path = tempfile.mkstemp(
+            prefix=f".{target_path.name}.",
+            suffix=".part",
+            dir=target_path.parent,
+        )
+        temp_path = Path(raw_temp_path)
+
         try:
-            await source.download(path, temp_path)
+            with os.fdopen(descriptor, "w+b") as local_file:
+                await source.download(path, local_file)
+                local_file.flush()
+                actual_size = os.fstat(local_file.fileno()).st_size
         except Exception as e:
             temp_path.unlink(missing_ok=True)
             download_error = e
@@ -287,8 +339,6 @@ async def _download_to_temp(
         except BaseException:
             temp_path.unlink(missing_ok=True)
             raise
-
-        actual_size = temp_path.stat().st_size
 
         if actual_size != expected_size:
             # a silent short read (early EOF) would otherwise be recorded as a
@@ -299,9 +349,9 @@ async def _download_to_temp(
             )
             continue
 
-        return None
+        return temp_path
 
-    return download_error
+    return download_error or OSError("download failed")
 
 
 async def _download_file(
@@ -317,22 +367,31 @@ async def _download_file(
     path, stat = planned.afc_path, planned.stat
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # download to a temp name and rename atomically, so an interrupted
-    # transfer never leaves a truncated file under the final name
-    temp_path = target_path.with_name(target_path.name + ".part")
-
-    download_error = await _download_to_temp(
-        source, path, temp_path, stat.size, download_retries
+    download_result = await _download_to_temp(
+        source, path, target_path, stat.size, download_retries
     )
 
-    if download_error is not None:
-        return FailedFile(afc_path=path, stat=stat, error=str(download_error))
+    if isinstance(download_result, Exception):
+        return FailedFile(afc_path=path, stat=stat, error=str(download_result))
+
+    temp_path = download_result
 
     if converting:
-        converted_path = temp_path.with_name(target_path.name + ".converted.part")
+        descriptor, raw_converted_path = tempfile.mkstemp(
+            prefix=f".{target_path.name}.",
+            suffix=".converted.part",
+            dir=target_path.parent,
+        )
+        converted_path = Path(raw_converted_path)
 
         try:
-            heic.convert_heic_to_jpeg(temp_path, converted_path)
+            with os.fdopen(descriptor, "w+b") as converted_file:
+                await asyncio.to_thread(
+                    heic.convert_heic_to_jpeg,
+                    temp_path,
+                    converted_file,
+                )
+                converted_file.flush()
         except Exception as e:
             converted_path.unlink(missing_ok=True)
             return FailedFile(
@@ -347,13 +406,23 @@ async def _download_file(
 
         temp_path = converted_path
 
+    if os.path.lexists(target_path):
+        temp_path.unlink(missing_ok=True)
+        error = f"failed to finalize: target was created while importing: {target_path}"
+        return FailedFile(afc_path=path, stat=stat, error=error)
+
     try:
         os.utime(temp_path, (datetime.now().timestamp(), stat.mtime.timestamp()))
+        local_size = temp_path.stat().st_size
+        db.begin_import(
+            path,
+            stat.size,
+            stat.mtime,
+            target_path,
+            local_size,
+        )
         os.replace(temp_path, target_path)
-
-        # record only after the file is fully in place, so a crash anywhere
-        # above means the file is re-imported on the next run
-        db.record(path, stat.size, stat.mtime)
+        db.complete_import(path, stat.size, stat.mtime)
     except Exception as e:
         # a failure finalizing one file (e.g. a momentarily locked db) must not
         # escape and cancel the whole TaskGroup — degrade it to a FailedFile
@@ -383,40 +452,71 @@ async def execute_import(
     Raises:
         MissingHeicSupportError: If `convert_heic` is set but pillow-heif is not installed."""
 
+    _require_at_least(concurrency, 1, "concurrency")
+    _require_at_least(download_retries, 0, "download_retries")
+
     if convert_heic and not heic.heic_support_available():
         raise heic.MissingHeicSupportError()
 
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # reserve every target path up front so same-named files cannot collide
     reserved: set[Path] = set()
-    jobs: list[tuple[PlannedFile, Path, bool]] = []
+    jobs = []
 
     for planned in plan.to_download:
         converting = convert_heic and planned.afc_path.suffix.lower() == ".heic"
         target_name = (
             f"{planned.afc_path.stem}.jpg" if converting else planned.afc_path.name
         )
-
+        rendered_path = layout.render(name=target_name, mtime=planned.stat.mtime)
         target_path = _available_path(
-            output_path / layout.render(name=target_name, mtime=planned.stat.mtime),
+            output_path / rendered_path,
             reserved,
         )
         reserved.add(target_path)
         jobs.append((planned, target_path, converting))
 
-    semaphore = asyncio.Semaphore(concurrency)
+    pending_jobs = iter(jobs)
 
-    async def download_one(planned: PlannedFile, target_path: Path, converting: bool):
-        async with semaphore:
+    async def download_one(
+        planned: PlannedFile, target_path: Path, converting: bool
+    ) -> NewFile | FailedFile | BaseException:
+        try:
             return await _download_file(
-                source, db, planned, target_path, converting, download_retries
+                source,
+                db,
+                planned,
+                target_path,
+                converting,
+                download_retries,
+            )
+        except (KeyboardInterrupt, SystemExit) as e:
+            return e
+
+    def create_task(
+        task_group: asyncio.TaskGroup,
+        job: tuple[PlannedFile, Path, bool],
+    ):
+        return task_group.create_task(download_one(*job))
+
+    async with asyncio.TaskGroup() as task_group:
+        pending = {
+            create_task(task_group, job)
+            for job in itertools.islice(pending_jobs, concurrency)
+        }
+
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
             )
 
-    # TaskGroup cancels the remaining downloads if one raises (only cancellation,
-    # KeyboardInterrupt or SystemExit escape download_one; failures become FailedFile)
-    async with asyncio.TaskGroup() as tg:
-        tasks = [tg.create_task(download_one(*job)) for job in jobs]
+            for task in done:
+                result = task.result()
 
-        for completed in asyncio.as_completed(tasks):
-            yield await completed
+                if isinstance(result, BaseException):
+                    raise result
+
+                if next_job := next(pending_jobs, None):
+                    pending.add(create_task(task_group, next_job))
+
+                yield result

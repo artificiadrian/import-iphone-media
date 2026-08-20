@@ -2,6 +2,7 @@
 Installed via the `heic` extra: `pip install dcimport[heic]`."""
 
 from pathlib import Path
+from typing import BinaryIO
 
 
 class MissingHeicSupportError(Exception):
@@ -24,7 +25,7 @@ def heic_support_available() -> bool:
         return True
 
 
-def convert_heic_to_jpeg(src: Path, dst: Path) -> None:
+def convert_heic_to_jpeg(src: Path, dst: BinaryIO) -> None:
     """Convert the HEIC file at `src` to a JPEG at `dst`, carrying over EXIF data."""
 
     import pillow_heif

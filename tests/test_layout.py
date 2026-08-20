@@ -1,8 +1,14 @@
 from datetime import datetime
+from pathlib import PurePosixPath
 
 import pytest
 
-from dcimport.layout import DEFAULT_LAYOUT, InvalidLayoutError, parse_layout
+from dcimport.layout import (
+    DEFAULT_LAYOUT,
+    InvalidLayoutError,
+    _validate_rendered_path,
+    parse_layout,
+)
 
 MTIME = datetime(2024, 1, 2, 3, 4, 5)
 
@@ -41,3 +47,19 @@ def test_absolute_layout_is_rejected():
 def test_parent_traversal_is_rejected():
     with pytest.raises(InvalidLayoutError, match=r"\.\."):
         parse_layout("../{name}")
+
+
+def test_absolute_mtime_format_is_rejected_during_parsing():
+    with pytest.raises(InvalidLayoutError, match="relative"):
+        parse_layout("{mtime:/tmp/}{name}")
+
+
+def test_windows_drive_relative_layout_is_rejected_during_parsing():
+    with pytest.raises(InvalidLayoutError, match="relative"):
+        parse_layout("C:{name}")
+
+
+@pytest.mark.parametrize("name", ["CON.jpg", "bad:name.jpg", "trailing. "])
+def test_windows_invalid_names_are_rejected(name):
+    with pytest.raises(InvalidLayoutError, match="Windows"):
+        _validate_rendered_path(PurePosixPath(name), windows=True)

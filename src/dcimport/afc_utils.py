@@ -1,7 +1,9 @@
 import asyncio
+import math
 from collections.abc import AsyncIterator
-from pathlib import Path, PurePosixPath
-from typing import cast
+from datetime import datetime
+from pathlib import PurePosixPath
+from typing import BinaryIO, Protocol, cast
 
 from pymobiledevice3 import usbmux
 from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError
@@ -9,6 +11,19 @@ from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.services.afc import MAXIMUM_READ_SIZE, AfcService
 
 from dcimport.importer import DirEntry, FileStat
+
+DEFAULT_OPERATION_TIMEOUT = 60.0
+DEFAULT_PAIR_TIMEOUT = 30.0
+
+
+def _require_finite_positive(value: float, name: str) -> None:
+    if not math.isfinite(value) or value <= 0:
+        msg = f"{name} must be finite and greater than zero"
+        raise ValueError(msg)
+
+
+class _LockdownConnection(Protocol):
+    async def close(self) -> None: ...
 
 
 class MultipleDevicesError(Exception):
@@ -23,100 +38,190 @@ class AfcSource:
     """MediaSource implementation backed by an AFC connection to an iPhone.
     Obtain via `afc_connect`; call `close` when done."""
 
-    def __init__(self, afc: AfcService, device_name: str | None = None):
+    def __init__(
+        self,
+        afc: AfcService,
+        device_name: str | None = None,
+        *,
+        lockdown: _LockdownConnection | None = None,
+        operation_timeout: float = DEFAULT_OPERATION_TIMEOUT,
+    ):
+        _require_finite_positive(operation_timeout, "operation_timeout")
+
         self._afc = afc
+        self._lockdown = lockdown
+        self._operation_timeout = operation_timeout
         self.device_name = device_name
 
     async def list_files(self, path: PurePosixPath) -> AsyncIterator[PurePosixPath]:
-        """Recursively list `path` via the AFC `dirlist` API."""
+        """Recursively list `path` with a deadline on each AFC request."""
 
-        async for entry in self._afc.dirlist(str(path)):
-            yield PurePosixPath(entry)
+        root = str(path)
+        pending_directories = [root]
+        yield path
+
+        while pending_directories:
+            directory = pending_directories.pop()
+            async with asyncio.timeout(self._operation_timeout):
+                names = await self._afc.listdir(directory)
+
+            directories = []
+            files = []
+
+            for name in names:
+                entry = str(PurePosixPath(directory) / name)
+                async with asyncio.timeout(self._operation_timeout):
+                    metadata = await self._afc.stat(entry)
+
+                if metadata.get("st_ifmt") == "S_IFDIR":
+                    directories.append(entry)
+                else:
+                    files.append(entry)
+
+            for entry in directories + files:
+                yield PurePosixPath(entry)
+
+            pending_directories.extend(reversed(directories))
 
     async def stat(self, path: PurePosixPath) -> FileStat | DirEntry:
         """Stat `path` via AFC, mapping a directory to `DirEntry`."""
 
-        raw = cast("dict", await self._afc.stat(str(path)))
+        async with asyncio.timeout(self._operation_timeout):
+            raw = await self._afc.stat(str(path))
 
-        # st_ifmt source: https://github.com/doronz88/pymobiledevice3/blob/master/pymobiledevice3/services/afc.py
         if raw.get("st_ifmt") == "S_IFDIR":
             return DirEntry()
 
-        return FileStat(size=raw["st_size"], mtime=raw["st_mtime"])
+        return FileStat(
+            size=cast(int, raw["st_size"]),
+            mtime=cast(datetime, raw["st_mtime"]),
+        )
 
-    async def download(self, path: PurePosixPath, target: Path) -> None:
+    async def download(self, path: PurePosixPath, target: BinaryIO) -> None:
         """Stream `path` off the device in chunks into local `target`."""
 
-        handle = await self._afc.fopen(str(path), "r")
+        async with asyncio.timeout(self._operation_timeout):
+            handle = await self._afc.fopen(str(path), "r")
+
+        download_error = None
 
         try:
-            with open(target, "wb") as local_file:
-                while True:
+            while True:
+                async with asyncio.timeout(self._operation_timeout):
                     data = await self._afc.fread(handle, MAXIMUM_READ_SIZE)
 
-                    if not data:
-                        break
+                if not data:
+                    break
 
-                    local_file.write(data)
+                target.write(data)
+        except BaseException as e:
+            download_error = e
+            raise
         finally:
-            await self._afc.fclose(handle)
+            try:
+                async with asyncio.timeout(self._operation_timeout):
+                    await self._afc.fclose(handle)
+            except BaseException:
+                if download_error is None:
+                    raise
 
     async def close(self):
-        # AfcService is an async context manager: __aexit__ tears down the demux
-        # reader task that fread/fclose depend on
-        await self._afc.__aexit__(None, None, None)
+        try:
+            async with asyncio.timeout(self._operation_timeout):
+                await self._afc.__aexit__(None, None, None)
+        finally:
+            if self._lockdown is not None:
+                async with asyncio.timeout(self._operation_timeout):
+                    await self._lockdown.close()
 
 
-async def afc_connect(udid: str | None = None, retries: int = 3) -> AfcSource:
-    """Connect to an iPhone and return an AfcSource. With multiple devices connected,
-    `udid` selects which one; without it, exactly one device must be connected.
+async def afc_connect(
+    udid: str | None = None,
+    retries: int = 3,
+    operation_timeout: float = DEFAULT_OPERATION_TIMEOUT,
+    pair_timeout: float = DEFAULT_PAIR_TIMEOUT,
+) -> AfcSource:
+    """Connect to an iPhone and return an AfcSource.
+
+    With multiple devices connected, `udid` selects which one; without it, exactly
+    one device must be connected. Pairing and AFC requests have separate deadlines.
 
     Raises:
         MultipleDevicesError: If several devices are connected and `udid` is None.
-        ConnectionError: If the connection fails after `retries` attempts (or due to an unknown error).
+        ConnectionError: If the connection fails after `retries` attempts.
+        ValueError: If a retry count or deadline is not positive.
     """
 
-    _e = None
+    if retries <= 0:
+        msg = "retries must be greater than zero"
+        raise ValueError(msg)
 
-    for i in range(retries):
+    _require_finite_positive(operation_timeout, "operation_timeout")
+    _require_finite_positive(pair_timeout, "pair_timeout")
+
+    last_error = None
+
+    for attempt in range(retries):
         try:
-            source = await _connect_once(udid)
-
+            source = await _connect_once(
+                udid,
+                operation_timeout=operation_timeout,
+                pair_timeout=pair_timeout,
+            )
         except MultipleDevicesError:
             raise
-
-        except ConnectionFailedToUsbmuxdError as e:
-            _e = e
-            await asyncio.sleep(2**i)  # exponential backoff
-
+        except (ConnectionFailedToUsbmuxdError, TimeoutError) as e:
+            last_error = e
+            await asyncio.sleep(2**attempt)
         except Exception as e:
             msg = "Failed to connect to the device due to an unexpected error"
             raise ConnectionError(msg) from e
-
         else:
             return source
 
     msg = f"Failed to connect to the device after {retries} attempts"
-    raise ConnectionError(msg) from _e
+    raise ConnectionError(msg) from last_error
 
 
-async def _connect_once(udid: str | None) -> AfcSource:
+async def _connect_once(
+    udid: str | None,
+    *,
+    operation_timeout: float,
+    pair_timeout: float,
+) -> AfcSource:
     if udid is None:
-        devices = await usbmux.list_devices()
-        # a device can show up once per connection type (usb + wifi)
+        async with asyncio.timeout(operation_timeout):
+            devices = await usbmux.list_devices()
         serials = sorted({device.serial for device in devices})
 
         if len(serials) > 1:
             raise MultipleDevicesError(udids=serials)
 
-    # upstream annotates `serial: str` but its own default is None (= any device)
-    lockdown = await create_using_usbmux(serial=cast("str", udid), autopair=True)
+    # create_using_usbmux owns the trust-prompt deadline and cleans up ordinary
+    # failures. Do not cancel it with the shorter AFC operation timeout.
+    lockdown = await create_using_usbmux(
+        serial=udid,
+        autopair=True,
+        pair_timeout=pair_timeout,
+    )
 
-    raw_name = await lockdown.get_value(key="DeviceName")
+    try:
+        async with asyncio.timeout(operation_timeout):
+            raw_name = await lockdown.get_value(key="DeviceName")
+            afc = AfcService(lockdown)
+            await afc.__aenter__()
+    except BaseException:
+        try:
+            async with asyncio.timeout(operation_timeout):
+                await lockdown.close()
+        except BaseException:
+            pass
+        raise
+
     device_name = raw_name if isinstance(raw_name, str) else lockdown.display_name
-
-    afc = AfcService(lockdown)
-    # __aenter__ starts the demux reader task that fread/fclose depend on
-    await afc.__aenter__()
-
-    return AfcSource(afc, device_name=device_name)
+    return AfcSource(
+        afc,
+        device_name=device_name,
+        lockdown=lockdown,
+        operation_timeout=operation_timeout,
+    )

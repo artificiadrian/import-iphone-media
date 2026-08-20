@@ -1,15 +1,16 @@
 import argparse
 import asyncio
 import json
+import math
 import sys
 from collections.abc import Sequence
 from datetime import datetime, time
 from importlib.metadata import version
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from rich.console import Console
 from rich.filesize import decimal as human_size
-from rich.markup import escape
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -18,9 +19,16 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
+from rich.text import Text
 
-from dcimport.afc_utils import AfcSource, MultipleDevicesError, afc_connect
-from dcimport.db import MediaDatabase
+from dcimport.afc_utils import (
+    DEFAULT_OPERATION_TIMEOUT,
+    DEFAULT_PAIR_TIMEOUT,
+    AfcSource,
+    MultipleDevicesError,
+    afc_connect,
+)
+from dcimport.db import LegacyTimezoneMigrationError, MediaDatabase
 from dcimport.heic import MissingHeicSupportError, heic_support_available
 from dcimport.immutable import immutable
 from dcimport.importer import (
@@ -48,8 +56,79 @@ def _parse_date(value: str):
         raise argparse.ArgumentTypeError(msg) from e
 
 
+def _parse_timezone(value: str) -> ZoneInfo:
+    """Parse an IANA timezone for a legacy media database migration."""
+
+    try:
+        return ZoneInfo(value)
+    except ZoneInfoNotFoundError as e:
+        msg = f"unknown IANA timezone '{value}'"
+        raise argparse.ArgumentTypeError(msg) from e
+
+
+def _parse_legacy_fold(value: str) -> int:
+    folds = {"earlier": 0, "later": 1}
+    try:
+        return folds[value]
+    except KeyError as e:
+        msg = "legacy fold must be 'earlier' or 'later'"
+        raise argparse.ArgumentTypeError(msg) from e
+
+
+def _parse_positive_float(value: str) -> float:
+    """Parse a finite positive decimal command-line value."""
+
+    try:
+        parsed = float(value)
+    except ValueError as e:
+        msg = f"invalid number '{value}'"
+        raise argparse.ArgumentTypeError(msg) from e
+
+    if not math.isfinite(parsed) or parsed <= 0:
+        msg = f"'{value}' must be greater than zero"
+        raise argparse.ArgumentTypeError(msg)
+
+    return parsed
+
+
+def _parse_nonnegative_int(value: str) -> int:
+    """Parse a nonnegative integer command-line value."""
+
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        msg = f"invalid integer '{value}'"
+        raise argparse.ArgumentTypeError(msg) from e
+
+    if parsed < 0:
+        msg = f"'{value}' must not be negative"
+        raise argparse.ArgumentTypeError(msg)
+
+    return parsed
+
+
+def _parse_positive_int(value: str) -> int:
+    """Parse an integer command-line value greater than zero."""
+
+    parsed = _parse_nonnegative_int(value)
+    if parsed == 0:
+        msg = f"'{value}' must be greater than zero"
+        raise argparse.ArgumentTypeError(msg)
+
+    return parsed
+
+
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Import media files from iPhone")
+    parser = argparse.ArgumentParser(
+        description="Import media files from iPhone",
+        add_help=False,
+    )
+    device_options = parser.add_argument_group("device options")
+    selection_options = parser.add_argument_group("file selection")
+    output_options = parser.add_argument_group("output options")
+    performance_options = parser.add_argument_group("performance and retries")
+    migration_options = parser.add_argument_group("legacy database migration")
+    diagnostics_options = parser.add_argument_group("diagnostics")
 
     parser.add_argument(
         "output",
@@ -58,122 +137,156 @@ def _parse_args():
         type=Path,
     )
 
-    parser.add_argument(
+    device_options.add_argument(
         "--dcim-path",
         metavar="PATH",
         help="Directory on iPhone to scan for media files",
-        type=str,
         default=DCIM_PATH,
     )
 
-    parser.add_argument(
+    output_options.add_argument(
         "--db-path",
         metavar="PATH",
         help="Library database location (default: media.db in the output directory)",
         type=Path,
-        default=None,
     )
 
-    parser.add_argument(
+    migration_options.add_argument(
+        "--legacy-timezone",
+        metavar="ZONE",
+        help="IANA timezone used by records in a pre-0.2 media.db",
+        type=_parse_timezone,
+    )
+
+    migration_options.add_argument(
+        "--legacy-fold",
+        metavar="{earlier,later}",
+        help="Resolve ambiguous daylight-saving timestamps",
+        type=_parse_legacy_fold,
+    )
+
+    selection_options.add_argument(
         "--include-extensions",
         metavar="EXT,EXT,...",
         help="List of file extensions to include (comma-separated)",
-        type=str,
         default=",".join(INCLUDE_EXTENSIONS),
     )
 
-    parser.add_argument(
+    output_options.add_argument(
         "--layout",
         metavar="TEMPLATE",
         help="Filename/subfolder template of {name} and {mtime:...}; stored and reused (default: timestamped)",
-        type=str,
-        default=None,
     )
 
-    parser.add_argument(
+    output_options.add_argument(
         "--force",
         help="Allow changing the layout stored in the database",
         action="store_true",
     )
 
-    parser.add_argument(
+    device_options.add_argument(
         "--udid",
         help="Device to import from, by UDID (needed when multiple are connected)",
-        type=str,
-        default=None,
     )
 
-    parser.add_argument(
+    selection_options.add_argument(
         "--skip-live-videos",
         help="Skip the video half of Live Photos",
         action="store_true",
     )
 
-    parser.add_argument(
+    output_options.add_argument(
         "--convert-heic",
         help="Convert HEIC photos to JPEG (needs the 'heic' extra)",
         action="store_true",
     )
 
-    parser.add_argument(
+    selection_options.add_argument(
         "--since",
         metavar="YYYY-MM-DD",
         help="Only import files modified on or after this date",
         type=_parse_date,
-        default=None,
     )
 
-    parser.add_argument(
+    selection_options.add_argument(
         "--until",
         metavar="YYYY-MM-DD",
         help="Only import files modified on or before this date",
         type=_parse_date,
-        default=None,
     )
 
-    parser.add_argument(
+    output_options.add_argument(
         "--manifest",
         metavar="PATH",
         help="Write a JSON report of imported and failed files",
         type=Path,
-        default=None,
     )
 
-    parser.add_argument(
+    performance_options.add_argument(
         "--concurrency",
         metavar="N",
         help="Number of files to download in parallel",
-        type=int,
+        type=_parse_positive_int,
         default=4,
     )
 
-    parser.add_argument(
+    performance_options.add_argument(
         "--retries",
         metavar="N",
         help="Retries per file before giving up",
-        type=int,
+        type=_parse_nonnegative_int,
         default=2,
     )
 
-    parser.add_argument(
+    device_options.add_argument(
+        "--operation-timeout",
+        metavar="SECONDS",
+        help="Maximum seconds to wait for each AFC operation",
+        type=_parse_positive_float,
+        default=DEFAULT_OPERATION_TIMEOUT,
+    )
+
+    device_options.add_argument(
+        "--pair-timeout",
+        metavar="SECONDS",
+        help="Maximum seconds to wait for the initial trust prompt",
+        type=_parse_positive_float,
+        default=DEFAULT_PAIR_TIMEOUT,
+    )
+
+    diagnostics_options.add_argument(
+        "-h",
+        "--help",
+        action="help",
+        help="Show this help message and exit",
+    )
+
+    diagnostics_options.add_argument(
         "--verbose",
         help="Enable verbose output",
         action="store_true",
     )
 
-    parser.add_argument(
+    diagnostics_options.add_argument(
         "--version",
         action="version",
         version=version("dcimport"),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.legacy_fold is not None and args.legacy_timezone is None:
+        parser.error("--legacy-fold requires --legacy-timezone")
+
+    return args
 
 
 def cli():
     args = _parse_args()
 
-    include_extensions = [ext.strip() for ext in args.include_extensions.split(",")]
+    include_extensions = tuple(
+        ext.strip() for ext in args.include_extensions.split(",")
+    )
 
     # a bare date bounds the whole day: --since starts at 00:00, --until ends at 23:59:59
     since = datetime.combine(args.since, time.min) if args.since else None
@@ -181,7 +294,7 @@ def cli():
 
     sys.exit(
         main(
-            output_path=Path(args.output),
+            output_path=args.output,
             dcim_path=args.dcim_path,
             db_path=args.db_path,
             include_extensions=include_extensions,
@@ -193,9 +306,13 @@ def cli():
             verbose=args.verbose,
             concurrency=args.concurrency,
             download_retries=args.retries,
+            operation_timeout=args.operation_timeout,
+            pair_timeout=args.pair_timeout,
             since=since,
             until=until,
             manifest=args.manifest,
+            legacy_timezone=args.legacy_timezone,
+            legacy_fold=args.legacy_fold,
         )
     )
 
@@ -216,9 +333,13 @@ class ImportConfig:
     verbose: bool
     concurrency: int
     download_retries: int
+    operation_timeout: float
+    pair_timeout: float
     since: datetime | None
     until: datetime | None
     manifest: Path | None
+    legacy_timezone: ZoneInfo | None
+    legacy_fold: int | None
 
 
 class _RunStats:
@@ -231,8 +352,12 @@ class _RunStats:
         self._failed = 0
 
     @property
-    def new(self):
-        return self._new
+    def completed(self):
+        return self._new + self._failed
+
+    @property
+    def failed(self):
+        return self._failed
 
     def record(self, result: NewFile | FailedFile):
         if isinstance(result, NewFile):
@@ -244,15 +369,34 @@ class _RunStats:
         return self._failed > 0
 
     def line(self):
-        text = (
-            f"Imported [bold green]{self._new}[/bold green] new"
-            f" and skipped [bold yellow]{self._existing}[/bold yellow] existing files"
-        )
+        text = Text("Imported ")
+        text.append_text(_file_phrase(self._new, "new", "bold green"))
+        text.append("; skipped ")
+        text.append_text(_file_phrase(self._existing, "existing", "yellow"))
 
         if self._failed:
-            text += f" ([bold red]{self._failed}[/bold red] failed)"
+            text.append("; ")
+            text.append_text(_file_phrase(self._failed, "failed", "bold red"))
 
+        text.append(".")
         return text
+
+
+def _file_phrase(count: int, label: str, style: str) -> Text:
+    noun = "file" if count == 1 else "files"
+    return Text(f"{count} {label} {noun}", style=style)
+
+
+def _plan_summary(plan: ImportPlan) -> Text:
+    text = Text("Found ")
+    text.append_text(_file_phrase(len(plan.to_download), "new", "bold green"))
+    text.append(f" ({human_size(plan.total_bytes)})", style="dim")
+    text.append(", ")
+    text.append_text(_file_phrase(len(plan.existing), "existing", "yellow"))
+    text.append(", ")
+    text.append_text(_file_phrase(len(plan.ignored), "ignored", "dim"))
+    text.append(".")
+    return text
 
 
 async def _download_all(
@@ -292,20 +436,28 @@ async def _download_all(
             stats.record(file)
             results.append(file)
 
-            if isinstance(file, FailedFile):
-                progress.console.print(
-                    f"[red]Failed to download[/red] [blue]{file.afc_path}[/blue]: {file.error}"
-                )
-
             if config.verbose:
-                progress.console.print(
-                    f"{'Downloaded' if isinstance(file, NewFile) else 'Failed'} [dim]{file.afc_path}[/dim]"
+                detail = Text(
+                    "Imported " if isinstance(file, NewFile) else "Failed ",
+                    style="green" if isinstance(file, NewFile) else "red",
                 )
+                detail.append(str(file.afc_path), style="cyan")
+
+                if isinstance(file, NewFile):
+                    detail.append(" → ")
+                    detail.append(str(file.local_path), style="cyan")
+                else:
+                    detail.append(f": {file.error}")
+
+                progress.console.print(detail)
 
             progress.advance(task, file.stat.size)
-            progress.update(
-                task, description=f"Importing ({stats.new}/{len(plan.to_download)})"
-            )
+            total_files = len(plan.to_download)
+            noun = "file" if total_files == 1 else "files"
+            description = f"Importing {stats.completed}/{total_files} {noun}"
+            if stats.failed:
+                description += f" ([bold red]{stats.failed} failed[/])"
+            progress.update(task, description=description)
 
     return results
 
@@ -318,13 +470,15 @@ def _report_failures(console: Console, results: list[NewFile | FailedFile]):
     if not failed:
         return
 
-    console.print(
-        "\n[bold yellow]Some files could not be downloaded.[/]"
-        " Re-run the same command to retry them:"
-    )
+    console.print(Text("\nFailed files:", style="bold red"))
 
     for file in failed:
-        console.print(f"  - [blue]{file.afc_path}[/blue]: {file.error}")
+        detail = Text("  ")
+        detail.append(str(file.afc_path), style="cyan")
+        detail.append(f"\n    {file.error}")
+        console.print(detail)
+
+    console.print("\nRun the same command to retry failed files.")
 
 
 def _write_manifest(path: Path, plan: ImportPlan, results: list[NewFile | FailedFile]):
@@ -368,7 +522,11 @@ async def _run_import(console: Console, config: ImportConfig):
         parse_layout(config.layout)
 
     config.output_path.mkdir(parents=True, exist_ok=True)
-    db = MediaDatabase(config.db_path or config.output_path / DEFAULT_DB_NAME)
+    db = MediaDatabase(
+        config.db_path or config.output_path / DEFAULT_DB_NAME,
+        legacy_timezone=config.legacy_timezone,
+        legacy_fold=config.legacy_fold,
+    )
 
     try:
         layout = resolve_layout(db, config.layout, config.force_layout)
@@ -377,14 +535,20 @@ async def _run_import(console: Console, config: ImportConfig):
 
         try:
             with console.status("Connecting to your device…"):
-                source = await afc_connect(udid=config.udid)
+                source = await afc_connect(
+                    udid=config.udid,
+                    operation_timeout=config.operation_timeout,
+                    pair_timeout=config.pair_timeout,
+                )
 
             device_name = source.device_name or "your device"
-            console.print(
-                f"Importing media from [blue]{config.dcim_path}[/blue] on"
-                f" [bold blue]{device_name}[/bold blue] to"
-                f" [blue]{config.output_path.absolute()}[/blue]"
-            )
+            introduction = Text("Importing from ")
+            introduction.append(device_name, style="bold")
+            introduction.append(": ")
+            introduction.append(config.dcim_path, style="cyan")
+            introduction.append(" → ")
+            introduction.append(str(config.output_path.absolute()), style="cyan")
+            console.print(introduction)
 
             with console.status("Scanning for media files…") as status:
                 plan = await plan_import(
@@ -400,16 +564,12 @@ async def _run_import(console: Console, config: ImportConfig):
                     ),
                 )
 
-            console.print(
-                f"Found [bold green]{len(plan.to_download)}[/bold green] new files ({human_size(plan.total_bytes)}),"
-                f" [bold yellow]{len(plan.existing)}[/bold yellow] already imported,"
-                f" [dim]{len(plan.ignored)} ignored[/dim]"
-            )
+            console.print(_plan_summary(plan))
 
             if not plan.to_download:
-                console.print(
-                    "[bold green]Already up to date.[/] Nothing new to import."
-                )
+                up_to_date = Text("Up to date.", style="bold green")
+                up_to_date.append(" No new files to import.")
+                console.print(up_to_date)
                 if config.manifest is not None:
                     _write_manifest(config.manifest, plan, [])
                 return 0
@@ -425,12 +585,16 @@ async def _run_import(console: Console, config: ImportConfig):
                 _write_manifest(config.manifest, plan, results)
 
             if stats.has_failures():
-                console.print(
-                    f"[bold yellow]Import completed with failures.[/] {stats.line()}"
-                )
+                summary = Text("Import complete with failures.", style="bold yellow")
+                summary.append(" ")
+                summary.append_text(stats.line())
+                console.print(summary)
                 return 1
 
-            console.print(f"[bold green]Import completed.[/] {stats.line()}")
+            summary = Text("Import complete.", style="bold green")
+            summary.append(" ")
+            summary.append_text(stats.line())
+            console.print(summary)
             return 0
         finally:
             if source is not None:
@@ -460,6 +624,10 @@ def main(
     since: datetime | None = None,
     until: datetime | None = None,
     manifest: Path | None = None,
+    operation_timeout: float = DEFAULT_OPERATION_TIMEOUT,
+    pair_timeout: float = DEFAULT_PAIR_TIMEOUT,
+    legacy_timezone: ZoneInfo | None = None,
+    legacy_fold: int | None = None,
 ):
     """Run the import and report progress on the console. Returns a process exit code
     (0 on success, 1 if the import failed or any file could not be downloaded)."""
@@ -477,9 +645,13 @@ def main(
         verbose=verbose,
         concurrency=concurrency,
         download_retries=download_retries,
+        operation_timeout=operation_timeout,
+        pair_timeout=pair_timeout,
         since=since,
         until=until,
         manifest=manifest,
+        legacy_timezone=legacy_timezone,
+        legacy_fold=legacy_fold,
     )
 
     console = Console()
@@ -488,10 +660,12 @@ def main(
         exit_code = asyncio.run(_run_import(console, config))
 
     except MultipleDevicesError as e:
-        console.print("\n[red]More than one device is connected:[/red]")
+        console.print(Text("\nMore than one device is connected:", style="bold red"))
 
         for device_udid in e.udids:
-            console.print(f"  - {device_udid}")
+            item = Text("  ")
+            item.append(device_udid, style="cyan")
+            console.print(item)
 
         console.print(
             "Pass [bold]--udid <UDID>[/bold] to pick the device to import from."
@@ -499,24 +673,30 @@ def main(
         return 1
 
     except LayoutConflictError as e:
-        console.print(
-            f"\n[red]{escape(str(e))}[/red]\nPass [bold]--force[/bold] to switch this library to the new layout"
-            " (already-imported files keep their names)."
+        message = Text("\nLayout conflict. ", style="bold red")
+        message.append(str(e))
+        message.append("\nPass ")
+        message.append("--force", style="bold")
+        message.append(
+            " to switch this library to the new layout. Existing files keep their names."
         )
+        console.print(message)
         return 1
 
-    except InvalidLayoutError as e:
-        console.print(f"\n[red]{escape(str(e))}[/red]")
-        return 1
-
-    except MissingHeicSupportError as e:
-        console.print(f"\n[red]{escape(str(e))}[/red]")
+    except (
+        InvalidLayoutError,
+        MissingHeicSupportError,
+        LegacyTimezoneMigrationError,
+    ) as e:
+        message = Text("\nError: ", style="bold red")
+        message.append(str(e))
+        console.print(message)
         return 1
 
     except ConnectionError:
         _maybe_traceback(console, verbose)
         console.print(
-            "\n[red]Could not connect to your device.[/red]\n"
+            "\n[bold red]Could not connect to your device.[/]\n"
             " - Check the USB connection.\n"
             " - Make sure your device is unlocked and trusts this computer.\n"
             " - On Windows, make sure the iTunes or Apple Devices app is installed and running.\n"
@@ -525,20 +705,23 @@ def main(
         return 1
 
     except KeyboardInterrupt:
-        console.print(
-            "\n[bold yellow]Import cancelled.[/] Finished downloads were kept —"
-            " re-run the same command to pick up where you left off."
+        message = Text("\nImport cancelled.", style="bold yellow")
+        message.append(
+            " Finished downloads were kept. Run the same command to continue."
         )
+        console.print(message)
         return 130
 
     except Exception as e:
         _maybe_traceback(console, verbose)
-        hint = (
-            "See the traceback above for details."
-            if verbose
-            else f"{escape(str(e))}\nRe-run with [bold]--verbose[/bold] for a full traceback."
-        )
-        console.print(f"\n[red]An unexpected error occurred. {hint}[/red]\n")
+        message = Text("\nAn unexpected error occurred.", style="bold red")
+        if verbose:
+            message.append(" See the traceback above for details.")
+        else:
+            message.append(f" {e}\nRe-run with ")
+            message.append("--verbose", style="bold")
+            message.append(" for a full traceback.")
+        console.print(message)
         console.print("[bold red]Import failed.[/]")
         return 1
 

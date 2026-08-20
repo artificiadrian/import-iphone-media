@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from dcimport.importer import DirEntry, FileStat
 
@@ -77,7 +78,7 @@ class FakeSource:
         finally:
             self.active_stats -= 1
 
-    async def download(self, path: PurePosixPath, target: Path):
+    async def download(self, path: PurePosixPath, target: BinaryIO):
         self.download_calls[str(path)] += 1
         self.active_downloads += 1
         self.max_concurrent_downloads = max(
@@ -92,16 +93,16 @@ class FakeSource:
             failures = self.download_failures.get(str(path))
 
             if failures:
-                target.write_bytes(file.data[: len(file.data) // 2])
+                target.write(file.data[: len(file.data) // 2])
                 raise failures.pop(0)
 
             truncations = self.truncations.get(str(path))
 
             if truncations:
-                target.write_bytes(file.data[: truncations.pop(0)])
+                target.write(file.data[: truncations.pop(0)])
                 return
 
-            target.write_bytes(file.data)
+            target.write(file.data)
         finally:
             self.active_downloads -= 1
 
@@ -115,12 +116,40 @@ class InMemoryDb:
 
     imported: set[tuple[str, int, datetime]] = field(default_factory=set)
     settings: dict[str, str] = field(default_factory=dict)
+    pending: dict[tuple[str, int, datetime], tuple[Path, int]] = field(
+        default_factory=dict
+    )
 
     def contains(self, afc_path: PurePosixPath, st_size: int, st_mtime: datetime):
         return (str(afc_path), st_size, st_mtime) in self.imported
 
-    def record(self, afc_path: PurePosixPath, st_size: int, st_mtime: datetime):
-        self.imported.add((str(afc_path), st_size, st_mtime))
+    def begin_import(
+        self,
+        afc_path: PurePosixPath,
+        st_size: int,
+        st_mtime: datetime,
+        local_path: Path,
+        local_size: int,
+    ):
+        self.pending[(str(afc_path), st_size, st_mtime)] = (local_path, local_size)
+
+    def complete_import(
+        self, afc_path: PurePosixPath, st_size: int, st_mtime: datetime
+    ):
+        key = (str(afc_path), st_size, st_mtime)
+        self.imported.add(key)
+        self.pending.pop(key, None)
+
+    def reconcile_pending_imports(self):
+        for key, (target, local_size) in self.pending.copy().items():
+            if (
+                target.is_file()
+                and not target.is_symlink()
+                and target.stat().st_size == local_size
+            ):
+                self.imported.add(key)
+
+            self.pending.pop(key)
 
     def get_setting(self, key: str):
         return self.settings.get(key)
